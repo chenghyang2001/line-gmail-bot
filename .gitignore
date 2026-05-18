@@ -1,0 +1,17 @@
+# 敏感憑證（絕對不進 git）
+.env
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
