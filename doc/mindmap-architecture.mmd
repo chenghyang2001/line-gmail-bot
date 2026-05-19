@@ -1,0 +1,66 @@
+mindmap
+  root((LINE × Gmail Bot))
+    進入點
+      main.py
+        FastAPI app
+        lifespan startup
+        POST /line-webhook
+        GET /health
+    服務模組
+      line_service.py
+        verify_signature
+          HMAC-SHA256 防偽造
+        extract_text_messages
+          過濾非文字事件
+        push_message
+          urllib 直呼 LINE API
+          不依賴 line-bot-sdk
+      gmail_service.py
+        get_gmail_service
+          OAuth2 token 自動 refresh
+          唯讀 scope
+        search_emails
+          Gmail query 語法
+          max 5 封
+        download_attachment
+          base64 解碼
+      claude_service.py
+        summarize
+          Haiku 4.5 最低成本
+          6000 字截斷保護
+          max_tokens 800
+      pdf_parser.py
+        extract_text_from_bytes
+          pypdf 解析
+          5 頁 × 2000 字限制
+    設定層
+      config.py
+        validate 啟動驗證
+        INTENT_KEYWORDS
+          addwii / 優惠 / 活動
+          韋德 語音識別補丁
+      .env
+        LINE_CHANNEL_SECRET
+        LINE_CHANNEL_ACCESS_TOKEN
+        ANTHROPIC_API_KEY
+        GMAIL_TOKEN_PATH
+    部署
+      本機開發
+        python main.py
+        load_dotenv 自動載入
+        port 8091 reload
+      VPS Hostinger
+        systemd line-gmail-bot
+        EnvironmentFile .env
+        Cloudflare Tunnel
+        linebot.chenghyang.uk
+    外部 API
+      LINE Messaging API
+        Webhook 接收
+        Push Message 推送
+      Gmail API
+        OAuth2 唯讀
+        token.json 自動更新
+      Anthropic API
+        claude-haiku-4-5
+        繁體中文摘要
