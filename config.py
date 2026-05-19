@@ -1,4 +1,5 @@
 """config.py — 從環境變數讀取並驗證所有服務設定，避免執行期才發現缺少 key"""
+# 備份版本：本機（專案目錄）— 使用前 cp config-local.py config.py
 import os
 from pathlib import Path
 
@@ -13,13 +14,9 @@ _REQUIRED_ENV_VARS: list[str] = [
 # 意圖偵測關鍵字（LINE 訊息含任一字即搜尋 Gmail）
 INTENT_KEYWORDS: list[str] = ["優惠", "活動", "健康", "addwii", "Addwii", "韋德", "方案", "S0", "空氣", "推薦", "小空間"]
 
-# 路徑常數（非機密，可在 import time 建立）
-DEFAULT_GMAIL_CREDENTIALS_PATH = str(
-    Path.home() / "line-gmail-bot" / "credentials.json"
-)
-DEFAULT_GMAIL_TOKEN_PATH = str(
-    Path.home() / "line-gmail-bot" / "token.json"
-)
+# 路徑常數（本機：使用 __file__ 相對於本檔案所在目錄，避免依賴家目錄結構）
+DEFAULT_GMAIL_CREDENTIALS_PATH = str(Path(__file__).parent / "credentials.json")
+DEFAULT_GMAIL_TOKEN_PATH = str(Path(__file__).parent / "token.json")
 
 
 def validate() -> None:
