@@ -4,6 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -149,3 +150,9 @@ async def gmail_search_and_reply(to: str, access_token: str, query_hint: str) ->
 async def health() -> dict[str, str]:
     """健康檢查端點，供 reverse proxy / systemd 監控用"""
     return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    load_dotenv()
+    uvicorn.run("main:app", host="0.0.0.0", port=8091, reload=True)
