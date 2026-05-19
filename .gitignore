@@ -21,3 +21,6 @@ venv/
 
 # 暫存輸出
 output/
+
+# Windows crash dump（Playwright/mmdc 在 Windows 產生，可安全忽略）
+*.stackdump
