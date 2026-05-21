@@ -1,6 +1,5 @@
 """main.py — LINE Webhook FastAPI server，接收 LINE 訊息後查 Gmail 並推摘要"""
 import json
-import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -9,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import config
-from services.claude_service import summarize
+from services.claude_service import classify_message, summarize
 from services.gmail_service import download_attachment, get_gmail_service, search_emails
 from services.line_service import (
     extract_text_messages,
@@ -17,6 +16,25 @@ from services.line_service import (
     verify_signature,
 )
 from services.pdf_parser import extract_text_from_bytes
+
+# 過短/純標點輸入時的固定提示，這類輸入不值得呼叫 Claude（省 token）
+_SHORT_INPUT_HINT: str = "請輸入想查詢的內容，例：addwii 有什麼優惠？"
+
+
+def _is_meaningful_input(text: str) -> bool:
+    """判斷輸入是否有意義（非空、非極短、非純標點）。
+
+    過短或純標點符號的輸入不值得呼叫 Claude，先擋下省 token。
+    """
+    stripped = text.strip()
+    # 空字串或單字元，沒有判斷意圖的價值
+    if len(stripped) < 2:
+        return False
+    # 不含任何文字/數字字元 → 純標點/符號
+    # 註：str.isalnum() 對中日韓文字也回 True，故中文輸入不會被誤擋
+    if not any(ch.isalnum() for ch in stripped):
+        return False
+    return True
 
 
 @asynccontextmanager
@@ -60,16 +78,32 @@ async def line_webhook(request: Request) -> JSONResponse:
     line_access_token = config.get("LINE_CHANNEL_ACCESS_TOKEN")
 
     for text in texts:
-        has_intent = any(kw.lower() in text.lower() for kw in config.INTENT_KEYWORDS)
-        if has_intent:
-            # 非同步查 Gmail 並推回結果
-            await gmail_search_and_reply(line_user_id, line_access_token, text)
-        else:
-            push_message(
-                line_access_token,
-                line_user_id,
-                "請輸入查詢關鍵字，例：addwii 有什麼優惠？",
+        try:
+            # ① 長度守門員：空/極短/純標點 → 推固定簡短提示，不呼叫 Claude（省 token）
+            if not _is_meaningful_input(text):
+                push_message(line_access_token, line_user_id, _SHORT_INPUT_HINT)
+                continue
+
+            # ② 子字串快速比對：命中關鍵字 → 零額外 API 成本直接查 Gmail
+            has_keyword = any(kw.lower() in text.lower() for kw in config.INTENT_KEYWORDS)
+            if has_keyword:
+                await gmail_search_and_reply(line_user_id, line_access_token, text)
+                continue
+
+            # ③ 子字串沒命中 → Claude 語意分類器判斷意圖
+            has_intent, friendly_reply = classify_message(
+                config.get("ANTHROPIC_API_KEY"), text
             )
+            if has_intent:
+                await gmail_search_and_reply(line_user_id, line_access_token, text)
+            else:
+                push_message(line_access_token, line_user_id, friendly_reply)
+        except Exception as exc:
+            # 單一訊息處理失敗不可穿透 → LINE 規定 webhook 必須回 200，
+            # 否則 LINE 會重試並可能停用 webhook。逐則獨立 catch，
+            # 一則失敗不中斷其他訊息的處理
+            print(f"[main] 處理訊息時發生未預期例外：{type(exc).__name__}: {exc}")
+            continue
 
     # LINE 要求無論事件處理結果如何都回 200
     return JSONResponse(content={"status": "ok"}, status_code=200)
