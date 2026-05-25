@@ -72,22 +72,26 @@ async def line_webhook(request: Request) -> JSONResponse:
         print(f"[main] webhook body JSON 解析失敗：{exc}")
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
-    texts: list[str] = extract_text_messages(webhook_body)
-
-    line_user_id = config.get("LINE_USER_ID", "U8ca91ed1c30228e776d83179a1893fb0")
+    # 空字串 fallback，讓 push_message 的空 to 防護機制處理（不硬編碼 prod User ID）
+    line_user_id = config.get("LINE_USER_ID", "")
     line_access_token = config.get("LINE_CHANNEL_ACCESS_TOKEN")
 
-    for text in texts:
+    # fallback_user_id 確保個人對話或沒有 source 時仍有推送目的地
+    messages: list[tuple[str, str]] = extract_text_messages(
+        webhook_body, fallback_user_id=line_user_id
+    )
+
+    for text, reply_to in messages:
         try:
             # ① 長度守門員：空/極短/純標點 → 推固定簡短提示，不呼叫 Claude（省 token）
             if not _is_meaningful_input(text):
-                push_message(line_access_token, line_user_id, _SHORT_INPUT_HINT)
+                push_message(line_access_token, reply_to, _SHORT_INPUT_HINT)
                 continue
 
             # ② 子字串快速比對：命中關鍵字 → 零額外 API 成本直接查 Gmail
             has_keyword = any(kw.lower() in text.lower() for kw in config.INTENT_KEYWORDS)
             if has_keyword:
-                await gmail_search_and_reply(line_user_id, line_access_token, text)
+                await gmail_search_and_reply(reply_to, line_access_token, text)
                 continue
 
             # ③ 子字串沒命中 → Claude 語意分類器判斷意圖
@@ -95,9 +99,9 @@ async def line_webhook(request: Request) -> JSONResponse:
                 config.get("ANTHROPIC_API_KEY"), text
             )
             if has_intent:
-                await gmail_search_and_reply(line_user_id, line_access_token, text)
+                await gmail_search_and_reply(reply_to, line_access_token, text)
             else:
-                push_message(line_access_token, line_user_id, friendly_reply)
+                push_message(line_access_token, reply_to, friendly_reply)
         except Exception as exc:
             # 單一訊息處理失敗不可穿透 → LINE 規定 webhook 必須回 200，
             # 否則 LINE 會重試並可能停用 webhook。逐則獨立 catch，
@@ -111,6 +115,10 @@ async def line_webhook(request: Request) -> JSONResponse:
 
 async def gmail_search_and_reply(to: str, access_token: str, query_hint: str) -> None:
     """查詢 Gmail 最新 addwii 活動信，有 PDF 則解析，整合摘要推送給使用者"""
+    # to 為空字串代表沒有有效推送目的地，直接跳過避免呼叫 Gmail 又無法回覆
+    if not to:
+        print("[main] gmail_search_and_reply 略過：to 為空字串")
+        return
     gmail_query = "subject:addwii (健康 OR 活動 OR 優惠)"
 
     try:
