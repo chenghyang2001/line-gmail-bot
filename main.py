@@ -261,16 +261,16 @@ async def gmail_search_and_reply(to: str, access_token: str, query_hint: str) ->
 async def _start_question_session(
     bot_token: str, chat_id: int | str, count: int
 ) -> None:
-    """開始消費者問題一問一答 session（Telegram 版）。
+    """產生一個消費者問題並以 @addwii_sales_bot 前綴傳送到 Telegram 群組。
 
-    1. 呼叫 generate_consumer_questions() 取得 N 個問題字串
-    2. 解析為逐行問題清單，存入 session_store（phase="asking"）
-    3. 傳送第一個問題到 chat_id
+    永遠只生成 1 題（不使用 count 參數，避免 session 管理複雜度），
+    直接傳訊息到群組，不進入一問一答 session 流程。
 
     若 generate_consumer_questions 失敗（回傳包含「暫時無法使用」、「失敗」），
-    直接把整串訊息推給使用者（降級行為），不進入 session，避免空問題列表卡住。
+    直接把整串訊息推給使用者（降級行為）。
     """
-    raw_result = generate_consumer_questions(config.get("ANTHROPIC_API_KEY"), count)
+    # 永遠只生成 1 題，count 參數不使用（避免多題 session 管理）
+    raw_result = generate_consumer_questions(config.get("ANTHROPIC_API_KEY"), 1)
 
     # 偵測降級訊息：generate_consumer_questions 失敗時回傳固定的錯誤訊息
     if "失敗" in raw_result or "暫時無法使用" in raw_result:
@@ -292,22 +292,12 @@ async def _start_question_session(
         tg_send_message(bot_token, chat_id, raw_result)
         return
 
-    # 建立並存入 asking session
-    from services.session_store import QuestionSession
-    new_session = QuestionSession(
-        phase="asking",
-        questions=questions,
-        current_idx=0,
-    )
-    session_store.set(chat_id, new_session)
-
-    # 傳送第一個問題，附上進度提示（使用者知道還有幾題）
-    total = len(questions)
-    first_q = questions[0]
+    # 取第一題加上 @addwii_sales_bot 前綴直接傳出，不設 session（只問一題不等回應）
+    question_text = questions[0]
     tg_send_message(
         bot_token,
         chat_id,
-        f"問題 1/{total}：{first_q}",
+        f"@addwii_sales_bot {question_text}",
     )
 
 
@@ -391,25 +381,19 @@ async def telegram_webhook(request: Request) -> JSONResponse:
             if not _is_meaningful_input(text):
                 continue
 
-            # ② 一問一答模式：session 進行中時，優先把回覆當成問題答案處理
-            session = session_store.get(chat_id)
-            if session.phase == "asking":
-                await _handle_question_reply(bot_token, chat_id, text, session)
-                continue
-
-            # ③ 消費者問題指令：「提出 N 個問題」→ 開始一問一答 session
+            # ② 消費者問題指令：「提出 N 個問題」→ 生成 1 題並以 @addwii_sales_bot 傳出
             if _is_generate_question(text):
                 count = _extract_count(text)
                 await _start_question_session(bot_token, chat_id, count)
                 continue
 
-            # ④ 子字串快速比對命中 → Gmail 查詢（零額外 Claude API 成本）
+            # ③ 子字串快速比對命中 → Gmail 查詢（零額外 Claude API 成本）
             has_keyword = any(kw.lower() in text.lower() for kw in config.INTENT_KEYWORDS)
             if has_keyword:
                 await tg_gmail_search_and_reply(bot_token, chat_id, text)
                 continue
 
-            # ⑤ 子字串沒命中 → Claude 語意分類判斷意圖
+            # ④ 子字串沒命中 → Claude 語意分類判斷意圖
             has_intent, friendly_reply = classify_message(
                 config.get("ANTHROPIC_API_KEY"), text
             )
