@@ -147,3 +147,18 @@ webhook 事件迴圈每則 text 各自包 `try/except Exception`，確保任何�
 | 摘要服務暫時無法使用 | anthropic SDK 版本過舊 | `pip install --upgrade anthropic` |
 | 回覆固定提示而非活動摘要 | 輸入過短被 `_is_meaningful_input` 守門員擋下，或 Claude 分類器降級回安全網訊息 | 檢查輸入是否過短／純標點；確認 Claude API 可用（VPS log 看是否一直 fallback） |
 | Gmail 服務未準備好 | token.json 不存在或路徑錯誤 | 確認 GMAIL_TOKEN_PATH，或重跑 `auth_gmail.py` |
+
+---
+
+## Telegram Desktop 自動化（tg_3round.py）
+
+測試腳本位於 `C:/tmp/tg_3round.py`（不進 git，Windows 本機專用）。
+完整技術棧與踩坑紀錄：`@instructions/windows-desktop-automation.md`
+
+**快速摘要**：
+
+- 找視窗：`pywin32` `EnumWindows` 比對標題
+- 前景焦點：`AttachThreadInput` + `SetForegroundWindow`（sleep 0.8s 等動畫）
+- 操作輸入框：`pywinauto backend='uia'`（UIAutomation，繞過 Qt5 single-HWND 限制）
+- CJK 輸入：PowerShell `Set-Clipboard` + `Ctrl+V`
+- 回覆輪詢：VPS `/sales-qa-latest`，用 `message_id > prev_id` 追蹤新回覆
