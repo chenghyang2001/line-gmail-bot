@@ -390,10 +390,12 @@ async def telegram_webhook(request: Request) -> JSONResponse:
 
     for text, chat_id in messages:
         try:
-            # ⓪ 跳過發給其他 Bot 的訊息（以 @xxx_bot 開頭但非本 bot）
-            # 例：@addwii_sales_bot addwii 有優惠 → 這是給 sales bot 的，本 bot 不介入
-            if re.match(r'^@\w+_bot\b', text, re.IGNORECASE) and \
-                    not text.lower().startswith('@addwii_prospect_bot'):
+            # ⓪ 白名單模式：只處理明確 @addwii_prospect_bot 的訊息，其餘一律略過
+            if '@addwii_prospect_bot' not in text.lower():
+                continue
+            # 移除 @addwii_prospect_bot mention，取後續純文字內容
+            text = re.sub(r'@addwii_prospect_bot\s*', '', text, flags=re.IGNORECASE).strip()
+            if not text:
                 continue
 
             # ① 長度守門員：空/極短/純標點 → 群組裡不推提示（太吵），直接略過
