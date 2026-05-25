@@ -2,6 +2,7 @@
 import json
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, AsyncGenerator
 
 from dotenv import load_dotenv
@@ -9,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import config
-from services.claude_service import classify_message, generate_consumer_questions, summarize
+from services.claude_service import classify_message, generate_consumer_questions, generate_sales_reply, summarize
 from services.gmail_service import download_attachment, get_gmail_service, search_emails
 from services.line_service import (
     extract_text_messages,
@@ -32,6 +33,10 @@ _SHORT_INPUT_HINT: str = "請輸入想查詢的內容，例：addwii 有什麼�
 
 # Telegram 最近問過的消費者問題（全群組共用，最多保留 10 條）
 _recent_tg_questions: list[str] = []
+
+# Sales Q&A 狀態儲存（tg-sales-interviewer.py 透過 /sales-qa-latest 端點輪詢）
+# 格式：{"question": str, "answer": str, "answered_at": str（ISO UTC）, "message_id": int}
+_latest_sales_qa: dict = {}
 
 
 def _is_meaningful_input(text: str) -> bool:
@@ -507,6 +512,101 @@ async def tg_gmail_search_and_reply(
     )
 
     tg_send_message(bot_token, chat_id, f"最新活動摘要：\n\n{summary}")
+
+
+@app.post("/sales-relay-webhook")
+async def sales_relay_webhook(request: Request) -> JSONResponse:
+    """接收 @addwii_sales_bot 的 Telegram webhook，用 Claude 生成業務回覆並推送到群組。
+
+    @addwii_sales_bot 的 webhook 指向此端點，VPS 作為其 AI 後端。
+    Q&A 同時存入 _latest_sales_qa 供 tg-sales-interviewer.py 輪詢。
+    永遠回 200，避免 Telegram 重試。
+    """
+    global _latest_sales_qa
+
+    body_bytes = await request.body()
+
+    # 驗 Telegram secret token（防止非 Telegram 來源偽造請求）
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    expected_sales_secret = config.get("ADDWII_SALES_SECRET_TOKEN", "")
+    if expected_sales_secret and secret_header != expected_sales_secret:
+        client_ip = request.client.host if request.client else "unknown"
+        print(f"[sales] invalid secret from {client_ip}")
+        return JSONResponse({"ok": True})
+
+    try:
+        update: dict = json.loads(body_bytes.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[sales] JSON 解析失敗：{exc}")
+        return JSONResponse({"ok": True})
+
+    msg = update.get("message") or {}
+    text: str = (msg.get("text") or "").strip()
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id: int = msg.get("message_id", 0)
+    sender: dict = msg.get("from") or {}
+    is_bot: bool = sender.get("is_bot", False)
+    username: str = sender.get("username") or sender.get("first_name", "unknown")
+
+    print(f"[sales] update from={username}(bot={is_bot}) chat={chat_id}: {text[:200]}")
+
+    # 過濾 bot 訊息（防止 prospect_bot 觸發 sales_relay，形成自我迴圈）
+    if is_bot:
+        print(f"[sales] 略過 bot 訊息 from={username}")
+        return JSONResponse({"ok": True})
+
+    # 只處理有內容的文字訊息
+    if not text or not chat_id:
+        return JSONResponse({"ok": True})
+
+    # 去除 @addwii_sales_bot mention 及行首多餘空白，取實際問題內容
+    # 只剝除 @addwii_sales_bot mention，\b 確保不誤刪 email 或其他 @username
+    cleaned = re.sub(r'@addwii_sales_bot\b\s*', '', text, flags=re.IGNORECASE, count=1).strip()
+    if not cleaned:
+        return JSONResponse({"ok": True})
+
+    # 用 Claude 生成業務回覆（generate_sales_reply 不 raise，確保此處不會例外穿透）
+    api_key = config.get("ANTHROPIC_API_KEY", "")
+    answer = generate_sales_reply(api_key, cleaned)
+
+    if not answer:
+        print(f"[sales] generate_sales_reply 回傳空字串，略過推送，question={cleaned[:60]}")
+        return JSONResponse({"ok": True})
+    # 用 @addwii_sales_bot token 推送回覆到群組
+    sales_token = config.get("ADDWII_SALES_BOT_TOKEN", "")
+    if sales_token:
+        tg_send_message(sales_token, chat_id, answer)
+        print(f"[sales] 已回覆 chat={chat_id}")
+    else:
+        # ADDWII_SALES_BOT_TOKEN 未設定時只記錄 Q&A，不推送（仍供 interviewer 輪詢用）
+        print("[sales] ADDWII_SALES_BOT_TOKEN 未設定，僅儲存 Q&A，不推送")
+
+    # 儲存最新 Q&A，供 tg-sales-interviewer.py 的 HTTP 輪詢使用
+    _latest_sales_qa = {
+        "question": cleaned,
+        "answer": answer,
+        "answered_at": datetime.now(timezone.utc).isoformat(),
+        "message_id": message_id,
+    }
+    print(f"[sales] Q&A 已儲存：question={cleaned[:80]}")
+
+    return JSONResponse({"ok": True})
+
+
+@app.get("/sales-qa-latest")
+async def sales_qa_latest(request: Request) -> dict:
+    """讓 tg-sales-interviewer.py 輪詢最新的 @addwii_sales_bot Q&A。
+
+    回傳格式：{"question": str, "answer": str, "answered_at": str, "message_id": int}
+    尚無記錄時回空 dict {}。
+    """
+    # 輕量 token 認證（SALES_POLL_TOKEN 未設定時開放存取，設定後強制驗證）
+    poll_token = config.get("SALES_POLL_TOKEN", "")
+    if poll_token:
+        from fastapi import HTTPException
+        if request.headers.get("X-Poll-Token", "") != poll_token:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    return _latest_sales_qa
 
 
 @app.get("/health")

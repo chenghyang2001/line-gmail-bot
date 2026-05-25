@@ -269,6 +269,33 @@ def generate_consumer_questions(
         return "問題產生失敗，請稍後再試"
 
 
+# Sales bot 用 system prompt：模擬 addwii 業務助理回答消費者問題
+_SYSTEM_SALES_REPLY: str = (
+    "你是 addwii 空氣清淨機品牌的專業業務助理，親切有禮。"
+    "addwii 主打家用空氣清淨機：S05（適合 ≤15坪，約 NT$8,800）、S10（適合 ≤30坪，約 NT$12,800）。"
+    "目前優惠：新品首批 85 折，加購濾網組合另享 9 折。HEPA 三層過濾，PM2.5 感應器即時顯示。"
+    "請用繁體中文回答，150 字以內，語氣親切自然，並主動詢問客戶使用環境和需求。"
+)
+
+
+def generate_sales_reply(api_key: str, question: str) -> str:
+    """用 Claude 根據 addwii 產品知識回答客戶的業務問題。
+
+    重複使用 _call_with_retry() 的 Haiku→Sonnet fallback 機制。
+    API 失敗時回傳預設道歉訊息，不 raise（確保 webhook 端點永遠能回覆群組）。
+
+    api_key 為空時直接回傳預設訊息，避免因環境未設定而拋例外。
+    question 截斷至 1000 字，避免 input token 浪費。
+    """
+    if not api_key:
+        return "感謝您的詢問！目前系統維護中，請稍後再詢問。"
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        return _call_with_retry(client, _SYSTEM_SALES_REPLY, question[:1000])
+    except RuntimeError:
+        return "感謝您的詢問！我們的業務人員將盡快為您服務。"
+
+
 if __name__ == "__main__":
     # 冒煙測試：只測純函式（不需 API key，不呼叫真實 Claude API）
     print("=== _parse_classify_result 冒煙測試 ===")

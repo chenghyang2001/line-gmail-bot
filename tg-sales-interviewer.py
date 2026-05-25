@@ -1,30 +1,28 @@
 """tg-sales-interviewer.py — 自動化 Telegram 業務問答迴圈
 
-從 VPS 讀取 bot token + API key，對 Telegram 群組發問，
-等待 addwii_sales_bot 回覆，再用 Claude Haiku 產出跟進問題，
-持續 N 輪並將對話記錄寫入 doc/tg-interview-YYYYMMDD-HHMMSS.md。
+用兩個 bot token（潛客 + 業務）模擬完整客戶對話：
+- @addwii_prospect_bot 發出消費者問題
+- Claude 生成業務回覆，以 @addwii_sales_bot 發到群組
+- Claude 根據回覆產出跟進問題，持續 N 輪
+- 對話記錄寫入 doc/tg-interview-YYYYMMDD-HHMMSS.md
+
+注意：Telegram bot-to-bot 訊息封鎖（無論 privacy mode）導致 webhook 無法觸發，
+因此業務回覆由本腳本直接生成，以 @addwii_sales_bot 身份發到群組。
 """
 import argparse
 import os
-import re
-import subprocess
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import anthropic
 
 # ── 關鍵設定常數 ─────────────────────────────────────────────────────────────
-VPS_SSH = "claude@187.127.109.145"
-SSH_KEY = str(Path.home() / ".ssh" / "id_ed25519")
 GROUP_CHAT_ID = -5186230345
 SALES_BOT_USERNAME = "addwii_sales_bot"
-POLL_INTERVAL = 3          # 輪詢間隔（秒）
-MAX_WAIT = 90              # 最多等候秒數
 MAX_ROUNDS = 3
 TG_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 OUTPUT_DIR = Path(__file__).parent / "doc"
@@ -36,40 +34,13 @@ _SYSTEM_FOLLOWUP = (
     "繁體中文，25字以內，只輸出問題本身，不要加前置詞或說明。"
 )
 
-
-def _fetch_vps_env(key: str) -> str:
-    """SSH 到 VPS 讀取 /opt/line-gmail-bot/.env 指定 key 的值。
-
-    解析 KEY=value / KEY="value" / KEY='value' 三種格式。
-    VPS env 在 .env 中統一管理，避免 key 散落在多處難以輪換。
-    """
-    try:
-        result = subprocess.run(
-            [
-                "ssh", "-i", SSH_KEY,
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=10",
-                VPS_SSH,
-                f"sudo grep ^{key}= /opt/line-gmail-bot/.env",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"無法從 VPS 讀取 {key}：SSH 連線逾時") from exc
-    except OSError as exc:
-        raise RuntimeError(f"無法從 VPS 讀取 {key}：{exc}") from exc
-
-    if result.returncode != 0:
-        raise RuntimeError(f"無法從 VPS 讀取 {key}（grep 找不到該 key）")
-
-    line = result.stdout.strip()
-    # 去掉 KEY= 前綴，再剝除單/雙引號
-    value = line.split("=", 1)[1].strip().strip("\"'")
-    if not value:
-        raise RuntimeError(f"VPS 的 {key} 值為空")
-    return value
+# 業務助理回覆 system prompt（與 VPS claude_service.py 保持一致）
+_SYSTEM_SALES_REPLY = (
+    "你是 addwii 空氣清淨機品牌的專業業務助理，親切有禮。"
+    "addwii 主打家用空氣清淨機：S05（適合 ≤15坪，約 NT$8,800）、S10（適合 ≤30坪，約 NT$12,800）。"
+    "目前優惠：新品首批 85 折，加購濾網組合另享 9 折。HEPA 三層過濾，PM2.5 感應器即時顯示。"
+    "請用繁體中文回答，150 字以內，語氣親切自然，並主動詢問客戶使用環境和需求。"
+)
 
 
 def _send_tg_message(bot_token: str, chat_id: int, text: str) -> bool:
@@ -97,58 +68,25 @@ def _send_tg_message(bot_token: str, chat_id: int, text: str) -> bool:
         return False
 
 
-def _extract_tg_in_text(log_line: str) -> str | None:
-    """從 journalctl 一行中提取 [TG-IN] 後的訊息文字。
+def _generate_sales_reply(client: anthropic.Anthropic, question: str) -> str:
+    """用 Claude 根據 addwii 產品知識生成業務回覆。
 
-    日誌格式範例：
-      ... INFO ... [TG-IN] chat=-5186230345 from=addwii_sales_bot(bot=True): 謝謝您的詢問...
-    提取冒號後的完整文字（去掉首尾空白）。
+    Telegram bot-to-bot 封鎖導致 @addwii_sales_bot webhook 無法被 @addwii_prospect_bot 觸發，
+    因此業務回覆改由本腳本直接呼叫 Claude 生成（而非透過 VPS webhook）。
+    max_tokens 設 300 足夠 150 字繁中回覆（~200 token）。
+    API 失敗時 raise RuntimeError，由 main() 決定是否中止。
     """
-    # 比對 from=<name>(bot=True): 後面的文字
-    pattern = r"\[TG-IN\].*?from=\S+\(bot=True\):\s*(.+)"
-    m = re.search(pattern, log_line)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
-def _poll_vps_for_response(since_utc: str, timeout: int, interval: int) -> str | None:
-    """SSH 輪詢 VPS journalctl，等 addwii_sales_bot(bot=True) 的 [TG-IN] 出現。
-
-    since_utc：journalctl --since 的時間字串（UTC，格式 'YYYY-MM-DD HH:MM:SS'）。
-    回傳訊息文字；超時後回 None。
-    """
-    elapsed = 0
-    while elapsed < timeout:
-        time.sleep(interval)
-        elapsed += interval
-        try:
-            result = subprocess.run(
-                [
-                    "ssh", "-i", SSH_KEY,
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "ConnectTimeout=10",
-                    VPS_SSH,
-                    f"sudo journalctl -u line-gmail-bot --since \"{since_utc}\""
-                    " --no-pager 2>/dev/null"
-                    f" | grep 'TG-IN.*{SALES_BOT_USERNAME}(bot=True)'"
-                    " | tail -1",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            # 單次 SSH 失敗不中止輪詢，繼續等下一個 interval
-            print(f"[poll] SSH 暫時失敗：{exc}，繼續輪詢...")
-            continue
-
-        if result.stdout.strip():
-            msg = _extract_tg_in_text(result.stdout.strip())
-            if msg:
-                return msg
-
-    return None
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        system=_SYSTEM_SALES_REPLY,
+        messages=[{"role": "user", "content": question[:1000]}],
+    )
+    block = message.content[0] if message.content else None
+    text = block.text.strip() if block and hasattr(block, "text") else ""
+    if not text:
+        raise RuntimeError("Claude 業務回覆生成失敗（回傳空內容）")
+    return text
 
 
 def _generate_followup(
@@ -205,15 +143,49 @@ def _append_to_md(output_path: Path, text: str) -> None:
 def main(rounds: int = MAX_ROUNDS) -> Path:
     """主流程：讀 env → 迴圈問答 → 寫 md → 回傳輸出路徑。
 
-    先嘗試從本機 os.environ 取 key，沒有才 SSH 到 VPS 讀取，
-    節省不必要的網路往返（本機開發時不需 VPS 連線）。
+    環境變數需求：
+    - TELEGRAM_BOT_TOKEN：@addwii_prospect_bot token（發出消費者問題）
+    - ADDWII_SALES_BOT_TOKEN：@addwii_sales_bot token（以此身份發業務回覆）
+    - ANTHROPIC_API_KEY：Claude API 金鑰
+
+    架構說明：Telegram bot-to-bot 訊息封鎖（即使 privacy mode 關閉），
+    @addwii_prospect_bot 的訊息無法觸發 @addwii_sales_bot 的 webhook。
+    因此業務回覆改由本腳本直接生成，以 @addwii_sales_bot 身份發到群組。
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_path = OUTPUT_DIR / f"tg-interview-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
 
     # ── 1. 取得 API Keys ──────────────────────────────────────────────────────
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or _fetch_vps_env("TELEGRAM_BOT_TOKEN")
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or _fetch_vps_env("ANTHROPIC_API_KEY")
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError(
+            "請設定環境變數 TELEGRAM_BOT_TOKEN（@addwii_prospect_bot）\n"
+            "Windows Git Bash 執行範例：\n"
+            "  PYTHONUTF8=1 TELEGRAM_BOT_TOKEN='8621...' "
+            "ADDWII_SALES_BOT_TOKEN='8957...' "
+            "ANTHROPIC_API_KEY='sk-ant-...' "
+            "python tg-sales-interviewer.py"
+        )
+    sales_bot_token = os.environ.get("ADDWII_SALES_BOT_TOKEN")
+    if not sales_bot_token:
+        raise RuntimeError(
+            "請設定環境變數 ADDWII_SALES_BOT_TOKEN（@addwii_sales_bot）\n"
+            "Windows Git Bash 執行範例：\n"
+            "  PYTHONUTF8=1 TELEGRAM_BOT_TOKEN='8621...' "
+            "ADDWII_SALES_BOT_TOKEN='8957...' "
+            "ANTHROPIC_API_KEY='sk-ant-...' "
+            "python tg-sales-interviewer.py"
+        )
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "請設定環境變數 ANTHROPIC_API_KEY\n"
+            "Windows Git Bash 執行範例：\n"
+            "  PYTHONUTF8=1 TELEGRAM_BOT_TOKEN='8621...' "
+            "ADDWII_SALES_BOT_TOKEN='8957...' "
+            "ANTHROPIC_API_KEY='sk-ant-...' "
+            "python tg-sales-interviewer.py"
+        )
 
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -237,7 +209,7 @@ def main(rounds: int = MAX_ROUNDS) -> Path:
 
         ts = datetime.now().strftime("%H:%M:%S")
         full_msg = f"@{SALES_BOT_USERNAME} {question}"
-        print(f"[Round {rnd}] 發送：{full_msg}")
+        print(f"[Round {rnd}] 發送問題：{full_msg}")
 
         _append_to_md(
             output_path,
@@ -245,27 +217,33 @@ def main(rounds: int = MAX_ROUNDS) -> Path:
             f"**[{ts}] 我的問題（發送至群組）：**\n> {full_msg}\n\n",
         )
 
-        # 記錄發送時間（UTC）作為 journalctl --since 的基準
-        since_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
+        # ── 發出消費者問題（以 @addwii_prospect_bot 身份）─────────────────
         if not _send_tg_message(bot_token, GROUP_CHAT_ID, full_msg):
-            _append_to_md(output_path, "**[錯誤] 訊息發送失敗，終止迴圈**\n")
-            print("[main] 訊息發送失敗，終止。")
+            _append_to_md(output_path, "**[錯誤] 問題訊息發送失敗，終止迴圈**\n")
+            print("[main] 問題發送失敗，終止。")
             break
 
-        # ── 等待 sales bot 回覆 ───────────────────────────────────────────
-        response = _poll_vps_for_response(since_utc, MAX_WAIT, POLL_INTERVAL)
-
-        ts_resp = datetime.now().strftime("%H:%M:%S")
-        if response is None:
+        # ── 生成業務回覆（Claude 本機直接呼叫）────────────────────────────
+        # bot-to-bot 訊息無法觸發 VPS webhook，改由本腳本直接生成
+        print(f"[Round {rnd}] 生成業務回覆中...")
+        try:
+            response = _generate_sales_reply(client, question)
+        except RuntimeError as exc:
+            ts_err = datetime.now().strftime("%H:%M:%S")
             _append_to_md(
                 output_path,
-                f"**[{ts_resp}] addwii業務助理 回應：**\n"
-                f"> （逾時 {MAX_WAIT}s，未收到回應）\n\n---\n\n",
+                f"**[{ts_err}] addwii業務助理 回應：**\n"
+                f"> （Claude API 失敗：{exc}）\n\n---\n\n",
             )
-            print(f"[main] 逾時未收到回應，終止。")
+            print(f"[main] 業務回覆生成失敗：{exc}，終止。")
             break
 
+        # ── 以 @addwii_sales_bot 身份發到群組 ────────────────────────────
+        if not _send_tg_message(sales_bot_token, GROUP_CHAT_ID, response):
+            # 發送失敗不中止，仍記錄回覆並繼續下一輪（群組通知是加分項，非必要）
+            print("[main] @addwii_sales_bot 訊息發送失敗（仍繼續記錄回覆）")
+
+        ts_resp = datetime.now().strftime("%H:%M:%S")
         print(f"[Round {rnd}] 收到回應：{response[:80]}...")
         _append_to_md(
             output_path,
@@ -276,6 +254,10 @@ def main(rounds: int = MAX_ROUNDS) -> Path:
         history.append({"role": "user", "content": question})
         history.append({"role": "assistant", "content": response})
         last_response = response
+
+        # 輪間間隔（避免 Telegram rate limit 問題）
+        if rnd < rounds:
+            time.sleep(2)
 
     # ── 4. 結束記錄 ──────────────────────────────────────────────────────────
     _append_to_md(
