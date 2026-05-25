@@ -396,7 +396,7 @@ async def telegram_webhook(request: Request) -> JSONResponse:
             _cid = (_raw_msg.get("chat") or {}).get("id", "?")
             print(
                 f"[TG-IN] chat={_cid} from={_name}(bot={_is_bot_flag}): "
-                f"{_raw_msg['text'][:120]}"
+                f"{_raw_msg['text'][:2000].replace(chr(10), ' ')}"
             )
     except Exception:
         pass  # debug log 失敗不影響主流程
