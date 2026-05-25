@@ -386,6 +386,21 @@ async def telegram_webhook(request: Request) -> JSONResponse:
         print("[main] TELEGRAM_BOT_TOKEN 未設定，略過 Telegram webhook")
         return JSONResponse({"ok": True})
 
+    # debug：記錄所有進來的文字訊息（含被後續過濾掉的），方便追蹤群組對話
+    try:
+        _raw_msg = update.get("message") or update.get("edited_message")
+        if isinstance(_raw_msg, dict) and _raw_msg.get("text"):
+            _sender = _raw_msg.get("from") or {}
+            _name = _sender.get("username") or _sender.get("first_name", "unknown")
+            _is_bot_flag = _sender.get("is_bot", False)
+            _cid = (_raw_msg.get("chat") or {}).get("id", "?")
+            print(
+                f"[TG-IN] chat={_cid} from={_name}(bot={_is_bot_flag}): "
+                f"{_raw_msg['text'][:120]}"
+            )
+    except Exception:
+        pass  # debug log 失敗不影響主流程
+
     messages = tg_extract_messages(update)
 
     for text, chat_id in messages:
