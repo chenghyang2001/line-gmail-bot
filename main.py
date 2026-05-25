@@ -311,6 +311,7 @@ async def _start_question_session(
     _recent_tg_questions.append(question_text)
     if len(_recent_tg_questions) > 10:
         _recent_tg_questions.pop(0)
+    print(f"[main] TG 問題已推送（歷史 {len(_recent_tg_questions)} 條）：{question_text[:80]}")
 
 
 async def _handle_question_reply(
