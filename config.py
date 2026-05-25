@@ -11,6 +11,10 @@ _REQUIRED_ENV_VARS: list[str] = [
     "ANTHROPIC_API_KEY",
 ]
 
+# 可選環境變數（有設定才啟用對應功能）
+# TELEGRAM_BOT_TOKEN    — Telegram bot token（@addwii_prospect_bot）
+# TELEGRAM_SECRET_TOKEN — webhook 驗簽 token（可空，空時跳過驗簽）
+
 # 意圖偵測關鍵字（LINE 訊息含任一字即搜尋 Gmail）
 INTENT_KEYWORDS: list[str] = ["優惠", "活動", "健康", "addwii", "Addwii", "韋德", "方案", "S0", "空氣", "推薦", "小空間"]
 

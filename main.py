@@ -1,8 +1,8 @@
-"""main.py — LINE Webhook FastAPI server，接收 LINE 訊息後查 Gmail 並推摘要"""
+"""main.py — LINE × Telegram Webhook FastAPI server，接收訊息後查 Gmail 並推摘要"""
 import json
 import re
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import TYPE_CHECKING, AsyncGenerator
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -17,6 +17,15 @@ from services.line_service import (
     verify_signature,
 )
 from services.pdf_parser import extract_text_from_bytes
+from services.telegram_service import (
+    extract_text_messages as tg_extract_messages,
+    send_message as tg_send_message,
+    verify_secret_token as tg_verify_secret,
+)
+from services.session_store import store as session_store
+
+if TYPE_CHECKING:
+    from services.session_store import QuestionSession
 
 # 過短/純標點輸入時的固定提示，這類輸入不值得呼叫 Claude（省 token）
 _SHORT_INPUT_HINT: str = "請輸入想查詢的內容，例：addwii 有什麼優惠？"
@@ -91,7 +100,7 @@ def _extract_count(text: str) -> int:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """啟動時驗證設定，確保環境齊全再接流量"""
     config.validate()
-    print("[main] LINE Gmail Bot 啟動，所有環境變數驗證通過")
+    print("[main] LINE × Telegram Gmail Bot 啟動，所有環境變數驗證通過")
     yield
     print("[main] 服務關閉")
 
@@ -247,6 +256,237 @@ async def gmail_search_and_reply(to: str, access_token: str, query_hint: str) ->
         to,
         f"📧 最新活動摘要：\n\n{summary}",
     )
+
+
+async def _start_question_session(
+    bot_token: str, chat_id: int | str, count: int
+) -> None:
+    """開始消費者問題一問一答 session（Telegram 版）。
+
+    1. 呼叫 generate_consumer_questions() 取得 N 個問題字串
+    2. 解析為逐行問題清單，存入 session_store（phase="asking"）
+    3. 傳送第一個問題到 chat_id
+
+    若 generate_consumer_questions 失敗（回傳包含「暫時無法使用」、「失敗」），
+    直接把整串訊息推給使用者（降級行為），不進入 session，避免空問題列表卡住。
+    """
+    raw_result = generate_consumer_questions(config.get("ANTHROPIC_API_KEY"), count)
+
+    # 偵測降級訊息：generate_consumer_questions 失敗時回傳固定的錯誤訊息
+    if "失敗" in raw_result or "暫時無法使用" in raw_result:
+        tg_send_message(bot_token, chat_id, raw_result)
+        return
+
+    # 解析問題清單：按行分割，過濾空行與純數字行號前綴（如「1. 」「2.」）
+    lines = [line.strip() for line in raw_result.splitlines() if line.strip()]
+    # 移除行首的「N. 」或「N.」編號前綴，還原純問題文字
+    questions: list[str] = []
+    for line in lines:
+        # 移除開頭的「1. 」「2.」等編號（支援空白可有可無）
+        clean = re.sub(r"^\d+[\.、．]\s*", "", line).strip()
+        if clean:
+            questions.append(clean)
+
+    if not questions:
+        # 解析結果為空（格式非預期）→ 降級推送原始內容
+        tg_send_message(bot_token, chat_id, raw_result)
+        return
+
+    # 建立並存入 asking session
+    from services.session_store import QuestionSession
+    new_session = QuestionSession(
+        phase="asking",
+        questions=questions,
+        current_idx=0,
+    )
+    session_store.set(chat_id, new_session)
+
+    # 傳送第一個問題，附上進度提示（使用者知道還有幾題）
+    total = len(questions)
+    first_q = questions[0]
+    tg_send_message(
+        bot_token,
+        chat_id,
+        f"問題 1/{total}：{first_q}",
+    )
+
+
+async def _handle_question_reply(
+    bot_token: str,
+    chat_id: int | str,
+    reply_text: str,
+    session: "QuestionSession",
+) -> None:
+    """處理使用者對消費者問題的回答，推進到下一題或結束 session。
+
+    1. 記錄本次回答到 log（未來可串接 Google Sheets 或 DB）
+    2. session.current_idx += 1（推進到下一題）
+    3. 若 is_done → 清除 session，傳感謝訊息
+    4. 否則 → 傳下一題，更新 session（刷新 last_active 防超時）
+
+    只移動 idx，不呼叫 Claude（問題已事先生成），故無額外 API 成本。
+    """
+    # 記錄回答（log 用途，未來可改為寫入 DB / Sheets）
+    print(
+        f"[main] Telegram 問題回答 chat_id={chat_id} "
+        f"Q[{session.current_idx}]：{reply_text[:80]}"
+    )
+
+    # 推進 idx
+    session.current_idx += 1
+
+    if session.is_done:
+        # 所有問題已回答完畢，清除 session 並致謝
+        session_store.clear(chat_id)
+        tg_send_message(
+            bot_token,
+            chat_id,
+            "感謝您的回饋！您的答案已記錄，對我們的產品改善非常有幫助。",
+        )
+    else:
+        # 仍有問題未問，傳下一題並更新 session（刷新 last_active）
+        total = len(session.questions)
+        next_q = session.current_question
+        session_store.set(chat_id, session)
+        tg_send_message(
+            bot_token,
+            chat_id,
+            f"問題 {session.current_idx + 1}/{total}：{next_q}",
+        )
+
+
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request) -> JSONResponse:
+    """接收 Telegram webhook update，驗簽後處理訊息意圖。
+
+    安全：驗 X-Telegram-Bot-Api-Secret-Token header。
+    永遠回 200（Telegram 也有重試機制，回 4xx 會觸發重試打爆系統）。
+    群組裡不推「請輸入查詢內容」提示（無意義輸入直接 continue，避免太吵）。
+    """
+    body_bytes: bytes = await request.body()
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    expected_secret = config.get("TELEGRAM_SECRET_TOKEN", "")
+
+    if not tg_verify_secret(secret_header, expected_secret):
+        client_ip = request.client.host if request.client else "unknown"
+        print(f"[main] Telegram invalid secret from {client_ip}")
+        return JSONResponse({"ok": True})
+
+    try:
+        update: dict = json.loads(body_bytes.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[main] Telegram update JSON 解析失敗：{exc}")
+        return JSONResponse({"ok": True})
+
+    bot_token = config.get("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        print("[main] TELEGRAM_BOT_TOKEN 未設定，略過 Telegram webhook")
+        return JSONResponse({"ok": True})
+
+    messages = tg_extract_messages(update)
+
+    for text, chat_id in messages:
+        try:
+            # ① 長度守門員：空/極短/純標點 → 群組裡不推提示（太吵），直接略過
+            if not _is_meaningful_input(text):
+                continue
+
+            # ② 一問一答模式：session 進行中時，優先把回覆當成問題答案處理
+            session = session_store.get(chat_id)
+            if session.phase == "asking":
+                await _handle_question_reply(bot_token, chat_id, text, session)
+                continue
+
+            # ③ 消費者問題指令：「提出 N 個問題」→ 開始一問一答 session
+            if _is_generate_question(text):
+                count = _extract_count(text)
+                await _start_question_session(bot_token, chat_id, count)
+                continue
+
+            # ④ 子字串快速比對命中 → Gmail 查詢（零額外 Claude API 成本）
+            has_keyword = any(kw.lower() in text.lower() for kw in config.INTENT_KEYWORDS)
+            if has_keyword:
+                await tg_gmail_search_and_reply(bot_token, chat_id, text)
+                continue
+
+            # ⑤ 子字串沒命中 → Claude 語意分類判斷意圖
+            has_intent, friendly_reply = classify_message(
+                config.get("ANTHROPIC_API_KEY"), text
+            )
+            if has_intent:
+                await tg_gmail_search_and_reply(bot_token, chat_id, text)
+            else:
+                tg_send_message(bot_token, chat_id, friendly_reply)
+
+        except Exception as exc:
+            # 單則訊息處理失敗不穿透，確保 webhook 永遠回 200
+            print(f"[main] Telegram 訊息處理例外：{type(exc).__name__}: {exc}")
+            continue
+
+    return JSONResponse({"ok": True})
+
+
+async def tg_gmail_search_and_reply(
+    bot_token: str, chat_id: int | str, query_hint: str
+) -> None:
+    """Telegram 版 Gmail 查詢 + 推送。
+
+    邏輯與 gmail_search_and_reply 相同，推送管道改用 tg_send_message。
+    chat_id 為空字串時略過（防呼叫 Gmail 卻無法回覆的浪費）。
+    """
+    if not chat_id and chat_id != 0:
+        print("[main] tg_gmail_search_and_reply 略過：chat_id 為空")
+        return
+
+    gmail_query = "subject:addwii (健康 OR 活動 OR 優惠)"
+
+    try:
+        service = get_gmail_service()
+    except RuntimeError as exc:
+        tg_send_message(bot_token, chat_id, f"Gmail 服務未準備好：{exc}")
+        return
+
+    try:
+        emails = search_emails(service, gmail_query, max_results=5)
+    except RuntimeError as exc:
+        tg_send_message(bot_token, chat_id, "查詢 Gmail 失敗，請稍後再試")
+        print(f"[main] Telegram Gmail 搜尋例外：{exc}")
+        return
+
+    if not emails:
+        tg_send_message(bot_token, chat_id, "目前無相關活動信件，請稍後再查詢")
+        return
+
+    latest = emails[0]
+    subject: str = latest.get("subject", "（無標題）")
+    body_text: str = latest.get("body", "")
+    attachments: list[dict] = latest.get("attachments", [])
+
+    pdf_text = ""
+    for att in attachments:
+        mime_ok = "pdf" in att.get("mimeType", "").lower()
+        name_ok = att["name"].lower().endswith(".pdf")
+        if mime_ok or name_ok:
+            try:
+                pdf_bytes = download_attachment(
+                    service, latest["id"], att["attachmentId"]
+                )
+                pdf_text = extract_text_from_bytes(pdf_bytes)
+            except RuntimeError as exc:
+                print(f"[main] Telegram PDF 附件下載失敗：{exc}")
+            break
+
+    combined = f"主旨：{subject}\n\n{body_text}"
+    if pdf_text:
+        combined += f"\n\n【PDF 內容】\n{pdf_text}"
+
+    summary = summarize(
+        config.get("ANTHROPIC_API_KEY"),
+        combined,
+        context_hint=query_hint,
+    )
+
+    tg_send_message(bot_token, chat_id, f"最新活動摘要：\n\n{summary}")
 
 
 @app.get("/health")
