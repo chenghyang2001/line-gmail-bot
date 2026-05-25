@@ -40,6 +40,14 @@ _SYSTEM_CLASSIFY: str = (
     "自然地引導使用者可以問「addwii 有什麼優惠」這類問題）。"
 )
 
+# 消費者問題產生器 system prompt
+_SYSTEM_GENERATE_QUESTIONS: str = (
+    "你是 addwii 的潛在消費者，對空氣品質改善、健康方案、優惠活動感興趣。"
+    "請根據真實消費者的角度，產生自然口語的繁體中文問題。"
+    "不要顯得像官方文案，要像真實使用者在詢問。"
+    "輸出格式：每個問題獨立一行，前面加編號（如 1. 2. 3.），不要其他說明文字。"
+)
+
 
 def _call_model(
     client: anthropic.Anthropic, model: str, system: str, user_prompt: str
@@ -221,6 +229,28 @@ def classify_message(api_key: str, text: str) -> tuple[bool, str]:
         return (False, _SAFETY_NET_MSG)
 
     return _parse_classify_result(raw)
+
+
+def generate_consumer_questions(api_key: str, n: int = 1) -> str:
+    """用 Claude 產生 N 個 addwii 消費者可能提出的問題。
+
+    n 必須在 1~5 之間，超出範圍時防禦性 clamp（呼叫端可先驗證，但此函式不拋錯）。
+    失敗時回傳固定錯誤訊息，不向上拋出例外，確保 bot 永遠有內容可推。
+
+    共用 _call_with_retry() 達成 Haiku→Sonnet retry/fallback，
+    避免重複實作 retry 邏輯造成維護困難。
+    """
+    # 防禦性 clamp：數量超出合理範圍時靜默修正，不讓 Claude 產出太多浪費 token
+    n = max(1, min(5, n))
+
+    user_prompt = f"請產生 {n} 個 addwii 消費者可能會問的問題。"
+    client = anthropic.Anthropic(api_key=api_key)
+
+    try:
+        return _call_with_retry(client, _SYSTEM_GENERATE_QUESTIONS, user_prompt)
+    except RuntimeError:
+        # 產題失敗時給固定罐頭訊息，不讓 bot 推空訊息或拋例外給 webhook
+        return "問題產生失敗，請稍後再試"
 
 
 if __name__ == "__main__":

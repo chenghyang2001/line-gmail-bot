@@ -1,5 +1,6 @@
 """main.py — LINE Webhook FastAPI server，接收 LINE 訊息後查 Gmail 並推摘要"""
 import json
+import re
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -8,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import config
-from services.claude_service import classify_message, summarize
+from services.claude_service import classify_message, generate_consumer_questions, summarize
 from services.gmail_service import download_attachment, get_gmail_service, search_emails
 from services.line_service import (
     extract_text_messages,
@@ -35,6 +36,55 @@ def _is_meaningful_input(text: str) -> bool:
     if not any(ch.isalnum() for ch in stripped):
         return False
     return True
+
+
+def _is_generate_question(text: str) -> bool:
+    """判斷訊息是否為「產生消費者問題」指令。
+
+    觸發條件（三個條件全部成立才回 True）：
+    1. 訊息包含「提出」或「產生」（動作詞）
+    2. 訊息包含「問題」（目標詞）
+    3. 訊息包含「addwii」或「消費者」或「使用者」（對象詞）
+
+    範例可觸發：「幫我產生 3 個消費者問題」、「提出 addwii 使用者會問的問題」
+    範例不觸發：「addwii 有什麼優惠」（無動作詞）、「產生報告」（無問題/對象詞）
+    """
+    normalized = text.strip().lower()
+    has_action = "提出" in normalized or "產生" in normalized or "生成" in normalized or "列出" in normalized
+    has_target = "問題" in normalized
+    has_subject = "addwii" in normalized or "消費者" in normalized or "使用者" in normalized
+    return has_action and has_target and has_subject
+
+
+# 中文數字 1-5 對應阿拉伯數字，用於 _extract_count 解析口語輸入
+_ZH_NUM: dict[str, int] = {"一": 1, "兩": 2, "二": 2, "三": 3, "四": 4, "五": 5}
+
+
+def _extract_count(text: str) -> int:
+    """從訊息中抽出數量，預設 1，上限 5。
+
+    解析優先序：
+    1. 阿拉伯數字（正規表達式抓第一個數字）
+    2. 中文數字（只處理 一/兩/二/三/四/五）
+    找不到數字 → 回傳 1；找到的數字超過 5 → clamp 到 5。
+
+    範例：
+    - 「產生 3 個消費者問題」 → 3
+    - 「提出兩個問題」 → 2
+    - 「產生消費者問題」 → 1（無數字，預設值）
+    - 「產生 10 個問題」 → 5（超出上限，clamp）
+
+    注意：不支援複合中文數字（如「二十」），二位數以上請改用阿拉伯數字（如「20」）。
+    """
+    # 優先嘗試阿拉伯數字
+    match = re.search(r'(\d+)', text)
+    if match:
+        return max(1, min(5, int(match.group(1))))
+    # fallback：掃描中文數字（_ZH_NUM 只含 1-5，不需 clamp）
+    for ch, val in _ZH_NUM.items():
+        if ch in text:
+            return val
+    return 1
 
 
 @asynccontextmanager
@@ -86,6 +136,17 @@ async def line_webhook(request: Request) -> JSONResponse:
             # ① 長度守門員：空/極短/純標點 → 推固定簡短提示，不呼叫 Claude（省 token）
             if not _is_meaningful_input(text):
                 push_message(line_access_token, reply_to, _SHORT_INPUT_HINT)
+                continue
+
+            # ★ NEW ② 產題模式：偵測「提出 N 個消費者問題」指令
+            if _is_generate_question(text):
+                count = _extract_count(text)
+                result = generate_consumer_questions(
+                    config.get("ANTHROPIC_API_KEY"), count
+                )
+                # LINE 單則訊息上限 5000 字元，預留 200 字給前綴與安全邊際
+                safe_result = result[:4800]
+                push_message(line_access_token, reply_to, f"🙋 消費者問題：\n\n{safe_result}")
                 continue
 
             # ② 子字串快速比對：命中關鍵字 → 零額外 API 成本直接查 Gmail
