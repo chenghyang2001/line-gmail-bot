@@ -9,3 +9,7 @@ what is the full path of the newly generate mermaid mindmap file?
 i want to create a new skill to generate the exact style of mermaid mindmap png file with these setting. the rules are just as i just required. summarize these rules first and then show me your plan to generate this style of mermaid mindmap png file given a certain input such as input file doc, txt, md and so on or a pasted text.
 
 go ahead and create the skill. create this skill in user-level
+
+--- Session 5 (2026-05-25) ---
+do the test again with another question by playwright. also I want the conversation to last for 3 loops (ask and response). so you keep the 2nd and 3rd questions based on the response you got from the previous question.
+→ 完成：tg_3round.py 改用 pywinauto UIAutomation，修復 d.get(answer)，3/3 輪端對端驗證通過
