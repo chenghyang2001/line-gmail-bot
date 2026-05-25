@@ -231,10 +231,14 @@ def classify_message(api_key: str, text: str) -> tuple[bool, str]:
     return _parse_classify_result(raw)
 
 
-def generate_consumer_questions(api_key: str, n: int = 1) -> str:
+def generate_consumer_questions(
+    api_key: str, n: int = 1, avoid_questions: list[str] | None = None
+) -> str:
     """用 Claude 產生 N 個 addwii 消費者可能提出的問題。
 
     n 必須在 1~5 之間，超出範圍時防禦性 clamp（呼叫端可先驗證，但此函式不拋錯）。
+    avoid_questions 若非空，提示 Claude 避開與清單中問題相似的題目，
+    減少重複（主題、角度、用詞都要不同）。
     失敗時回傳固定錯誤訊息，不向上拋出例外，確保 bot 永遠有內容可推。
 
     共用 _call_with_retry() 達成 Haiku→Sonnet retry/fallback，
@@ -244,6 +248,18 @@ def generate_consumer_questions(api_key: str, n: int = 1) -> str:
     n = max(1, min(5, n))
 
     user_prompt = f"請產生 {n} 個 addwii 消費者可能會問的問題。"
+
+    # 有近期問題清單時，附加避免重複的指示；清單為空則不附加，省 token
+    if avoid_questions:
+        avoid_lines = "\n".join(
+            f"{i + 1}. {q}" for i, q in enumerate(avoid_questions)
+        )
+        user_prompt += (
+            "\n\n請注意：避免產生與以下已問過的問題相似的題目"
+            "（主題、角度、用詞都要不同）：\n"
+            + avoid_lines
+        )
+
     client = anthropic.Anthropic(api_key=api_key)
 
     try:

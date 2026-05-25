@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 # 過短/純標點輸入時的固定提示，這類輸入不值得呼叫 Claude（省 token）
 _SHORT_INPUT_HINT: str = "請輸入想查詢的內容，例：addwii 有什麼優惠？"
 
+# Telegram 最近問過的消費者問題（全群組共用，最多保留 10 條）
+_recent_tg_questions: list[str] = []
+
 
 def _is_meaningful_input(text: str) -> bool:
     """判斷輸入是否有意義（非空、非極短、非純標點）。
@@ -270,7 +273,11 @@ async def _start_question_session(
     直接把整串訊息推給使用者（降級行為）。
     """
     # 永遠只生成 1 題，count 參數不使用（避免多題 session 管理）
-    raw_result = generate_consumer_questions(config.get("ANTHROPIC_API_KEY"), 1)
+    # 傳入最近 5 個問題給 Claude 參考，避免重複相似主題
+    avoid = _recent_tg_questions[-5:] if _recent_tg_questions else None
+    raw_result = generate_consumer_questions(
+        config.get("ANTHROPIC_API_KEY"), 1, avoid_questions=avoid
+    )
 
     # 偵測降級訊息：generate_consumer_questions 失敗時回傳固定的錯誤訊息
     if "失敗" in raw_result or "暫時無法使用" in raw_result:
@@ -299,6 +306,11 @@ async def _start_question_session(
         chat_id,
         f"@addwii_sales_bot {question_text}",
     )
+
+    # 記錄到近期問題清單，避免下次重複
+    _recent_tg_questions.append(question_text)
+    if len(_recent_tg_questions) > 10:
+        _recent_tg_questions.pop(0)
 
 
 async def _handle_question_reply(
