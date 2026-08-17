@@ -24,3 +24,6 @@ output/
 
 # Windows crash dump（Playwright/mmdc 在 Windows 產生，可安全忽略）
 *.stackdump
+
+token_modify.json
+token*.json
